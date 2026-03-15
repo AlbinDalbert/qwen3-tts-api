@@ -54,7 +54,7 @@ class TTSRequest(BaseModel):
     language: str = Field(default="Auto", description="Language or Auto")
     audio_format: str = Field(default="wav", description="wav | ogg")
     mode: str = Field(default="clone", description="clone | design")
-    model_size: str = Field(default="fast", description="fast | quality")
+    model_size: str = Field(default="fast", description="fast | quality | auto")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
@@ -85,6 +85,7 @@ class QwenService:
         # Force local-only model resolution by default so runtime never depends on
         # live Hugging Face API checks (works with pre-populated HF cache).
         self.local_files_only = os.getenv("QWEN_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
+        self.auto_quality_min_vram_mb = int(os.getenv("QWEN_AUTO_QUALITY_MIN_VRAM_MB", "3000"))
         self.lock = threading.Lock()
         self.load_lock = threading.Lock()
         self._model = None
@@ -148,19 +149,52 @@ class QwenService:
             raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
         return candidate
 
+    def _resolve_model_size(self, mode: str, requested_size: str) -> str:
+        size = (requested_size or "quality").strip().lower()
+        if size not in {"fast", "quality", "auto"}:
+            size = "quality"
+
+        if size == "auto":
+            threshold_bytes = self.auto_quality_min_vram_mb * 1024 * 1024
+            free_vram_bytes = 0
+            total_vram_bytes = 0
+
+            if torch.cuda.is_available():
+                try:
+                    free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info()
+                except Exception:
+                    free_vram_bytes = 0
+                    total_vram_bytes = 0
+
+            selected_size = "quality" if free_vram_bytes >= threshold_bytes else "fast"
+            print(
+                json.dumps(
+                    {
+                        "event": "tts_model_size_auto",
+                        "mode": mode,
+                        "requested": "auto",
+                        "selected": selected_size,
+                        "free_vram_mb": int(free_vram_bytes / (1024 * 1024)),
+                        "total_vram_mb": int(total_vram_bytes / (1024 * 1024)),
+                        "threshold_mb": self.auto_quality_min_vram_mb,
+                    }
+                )
+            )
+            size = selected_size
+
+        if mode == "design" and size == "fast":
+            print(json.dumps({"event": "tts_warn", "detail": "design mode does not support fast; using quality"}))
+            size = "quality"
+
+        return size
+
     def synthesize(self, req: TTSRequest, user_dir: Path, extra_kwargs: Optional[dict] = None):
         extra_kwargs = extra_kwargs or {}
         mode = (req.mode or "clone").strip().lower()
         if mode not in MODEL_IDS:
             raise HTTPException(status_code=400, detail="mode must be clone or design")
 
-        size = (req.model_size or "quality").strip().lower()
-        if size not in {"fast", "quality"}:
-            size = "quality"
-
-        if mode == "design" and size == "fast":
-            print(json.dumps({"event": "tts_warn", "detail": "design mode does not support fast; using quality"}))
-            size = "quality"
+        size = self._resolve_model_size(mode, req.model_size or "quality")
 
         if size not in MODEL_IDS[mode]:
             size = "quality"
@@ -475,7 +509,7 @@ def info():
     return {
         "models": MODEL_IDS,
         "modes": ["clone", "design"],
-        "sizes": ["fast", "quality"],
+        "sizes": ["fast", "quality", "auto"],
         "current_model": svc._model_id,
         "supported_languages": SUPPORTED_LANGUAGES,
     }

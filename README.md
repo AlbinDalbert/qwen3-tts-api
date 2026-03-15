@@ -30,7 +30,8 @@ Fields:
 - `language` (default `Auto`)
 - `audio_format` (`wav` or `ogg`)
 - `mode` (`clone` or `design`)
-- `model_size` (`fast` or `quality`; design uses `quality`)
+- `model_size` (`fast`, `quality`, or `auto`; design uses `quality`)
+  - `auto` selects `quality` when free CUDA VRAM is >= `QWEN_AUTO_QUALITY_MIN_VRAM_MB` (default `3000`), otherwise `fast`
 - `reference_audio` (required in `clone` mode)
 - `voice_description` (required in `design` mode unless `voice_preset` is provided)
 - `voice_preset` (optional preset name from `/voice-presets`; overrides `voice_description` and forces `design` mode)
@@ -105,6 +106,7 @@ kubectl apply -f k8s/service.yaml
 - `QWEN_DEFAULT_LANGUAGE`
 - `QWEN_DEFAULT_SPEAKER`
 - `QWEN_DEFAULT_INSTRUCT`
+- `QWEN_AUTO_QUALITY_MIN_VRAM_MB` (used when `model_size=auto`, default `3000`)
 
 ## Notes
 
