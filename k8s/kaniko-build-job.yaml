@@ -18,7 +18,7 @@ spec:
             - sh
             - -c
             - |
-              git clone --depth=1 https://github.com/sententia-bot/qwen3-tts-api.git /workspace
+              git clone --depth=1 https://github.com/AlbinDalbert/qwen3-tts-api.git /workspace
               echo "Cloned. Contents:"
               ls -la /workspace
           volumeMounts:
@@ -31,7 +31,7 @@ spec:
           args:
             - --context=dir:///workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=ghcr.io/sententia-bot/qwen3-tts-api:latest
+            - --destination=ghcr.io/albindalbert/qwen3-tts-api:latest
             - --cache=true
             - --cache-dir=/cache
             - --compressed-caching=false

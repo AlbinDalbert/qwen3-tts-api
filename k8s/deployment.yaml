@@ -27,7 +27,7 @@ spec:
         - name: ghcr-pull-secret
       containers:
         - name: api
-          image: ghcr.io/sententia-bot/qwen3-tts-api:latest
+          image: ghcr.io/albindalbert/qwen3-tts-api:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8888

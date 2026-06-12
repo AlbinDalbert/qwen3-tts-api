@@ -12,19 +12,19 @@ data:
   QWEN_DEFAULT_SPEAKER: Ryan
   QWEN_DEFAULT_INSTRUCT: ""
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-  QWEN_MAX_CHUNK_CHARS: "220"
-  QWEN_STREAM_PREBUFFER_CHUNKS: "2"
+  QWEN_MAX_CHUNK_CHARS: "250"
+  QWEN_STREAM_PREBUFFER_CHUNKS: "1"
   QWEN_TRIM_CHUNK_SILENCE: "1"
   QWEN_TRIM_SILENCE_KEEP_MS: "60"
   QWEN_CHUNK_FADE_MS: "8"
-  QWEN_MAX_NEW_TOKENS: "192"
-  QWEN_MAX_NEW_TOKENS_PER_CHAR: "1.0"
-  QWEN_MAX_NEW_TOKENS_BUFFER: "48"
+  QWEN_MAX_NEW_TOKENS: "512"
+  QWEN_MAX_NEW_TOKENS_PER_CHAR: "2.0"
+  QWEN_MAX_NEW_TOKENS_BUFFER: "64"
   # qwen's name is inverted: "0" enables its lower-latency streaming-text path.
   QWEN_NON_STREAMING_MODE: "0"
-  # Keep auxiliary modules off the 3 GiB GPU. This trades decode/clone-prompt speed
-  # for enough CUDA headroom to actually generate.
-  QWEN_SPEECH_TOKENIZER_DEVICE: cpu
+  # On ~8 GiB GPUs, keep the auxiliary tokenizer/vocoder and clone speaker encoder
+  # on CUDA for lower latency. Use k8s/configmap.yaml for the small-GPU CPU-offload profile.
+  QWEN_SPEECH_TOKENIZER_DEVICE: cuda:0
   QWEN_SPEECH_TOKENIZER_CPU_DTYPE: float32
-  QWEN_SPEAKER_ENCODER_DEVICE: cpu
+  QWEN_SPEAKER_ENCODER_DEVICE: cuda:0
   QWEN_SPEAKER_ENCODER_CPU_DTYPE: float32

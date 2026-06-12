@@ -47,6 +47,58 @@ MODEL_IDS = {
     },
 }
 model_status = {"state": "idle", "model_id": None}  # idle | loading | ready
+QWEN_MEMORY_PATCH_ENABLED = False
+
+
+def patch_qwen_tts_memory() -> None:
+    """Reduce upstream qwen-tts generation memory use.
+
+    qwen-tts 0.1.1 stores every transformer layer hidden state for every
+    generated audio token because it uses the HF `hidden_states` channel to
+    smuggle codec ids back out of `generate()`. The public API only needs the
+    codec ids. Keep that channel, but replace the huge all-layer payload with
+    the one last-token hidden vector the upstream wrapper expects.
+    """
+    global QWEN_MEMORY_PATCH_ENABLED
+    try:
+        from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerForConditionalGeneration
+    except Exception as e:
+        print(json.dumps({"event": "qwen_memory_patch_skipped", "detail": str(e)}), flush=True)
+        return
+
+    if getattr(Qwen3TTSTalkerForConditionalGeneration, "_qwen3_tts_api_memory_patch", False):
+        QWEN_MEMORY_PATCH_ENABLED = True
+        return
+
+    import functools
+
+    original_forward = Qwen3TTSTalkerForConditionalGeneration.forward
+
+    @functools.wraps(original_forward)
+    def memory_light_forward(self, *args, **kwargs):
+        # GenerationMixin still needs output_hidden_states=True at the outer
+        # level so it collects our custom `(last_hidden, codec_ids)` payload.
+        # But the inner transformer does not need to materialize all layer
+        # hidden states; that is the expensive part.
+        kwargs["output_hidden_states"] = False
+        output = original_forward(self, *args, **kwargs)
+        try:
+            hidden_payload = getattr(output, "hidden_states", None)
+            codec_ids = hidden_payload[-1] if isinstance(hidden_payload, (tuple, list)) and hidden_payload else None
+            compact_last_hidden = getattr(output, "past_hidden", None)
+            if compact_last_hidden is not None or codec_ids is not None:
+                output.hidden_states = ((compact_last_hidden,), codec_ids)
+        except Exception as e:
+            print(json.dumps({"event": "qwen_memory_patch_payload_error", "detail": str(e)}), flush=True)
+        return output
+
+    Qwen3TTSTalkerForConditionalGeneration.forward = memory_light_forward
+    Qwen3TTSTalkerForConditionalGeneration._qwen3_tts_api_memory_patch = True
+    QWEN_MEMORY_PATCH_ENABLED = True
+    print(json.dumps({"event": "qwen_memory_patch_enabled"}), flush=True)
+
+
+patch_qwen_tts_memory()
 
 
 class TTSRequest(BaseModel):
@@ -86,24 +138,95 @@ class QwenService:
         # live Hugging Face API checks (works with pre-populated HF cache).
         self.local_files_only = os.getenv("QWEN_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
         self.auto_quality_min_vram_mb = int(os.getenv("QWEN_AUTO_QUALITY_MIN_VRAM_MB", "3000"))
+        self.max_new_tokens = int(os.getenv("QWEN_MAX_NEW_TOKENS", "192"))
+        self.max_new_tokens_per_char = float(os.getenv("QWEN_MAX_NEW_TOKENS_PER_CHAR", "1.0"))
+        self.max_new_tokens_buffer = int(os.getenv("QWEN_MAX_NEW_TOKENS_BUFFER", "48"))
+        # On ~3 GiB GPUs the 0.6B talker can fit, but the auxiliary vocoder /
+        # speech tokenizer and speaker encoder leave almost no generation
+        # headroom. Keep those aux modules on CPU by default; only the talker
+        # stays on CUDA for generation.
+        self.speech_tokenizer_device = os.getenv("QWEN_SPEECH_TOKENIZER_DEVICE", "cpu").strip().lower()
+        self.speech_tokenizer_cpu_dtype = os.getenv("QWEN_SPEECH_TOKENIZER_CPU_DTYPE", "float32").strip().lower()
+        self.speaker_encoder_device = os.getenv("QWEN_SPEAKER_ENCODER_DEVICE", "cpu").strip().lower()
+        self.speaker_encoder_cpu_dtype = os.getenv("QWEN_SPEAKER_ENCODER_CPU_DTYPE", "float32").strip().lower()
+        # qwen's parameter is inverted: non_streaming_mode=False enables its
+        # lower-latency streaming-text path. Keep false by default.
+        self.non_streaming_mode = os.getenv("QWEN_NON_STREAMING_MODE", "0").lower() in {"1", "true", "yes"}
         self.lock = threading.Lock()
         self.load_lock = threading.Lock()
+        self.generation_lock = threading.Lock()
         self._model = None
         self._model_id: Optional[str] = None
 
     def _torch_dtype(self):
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
 
+    def _dtype_from_name(self, name: str):
+        normalized = (name or "").strip().lower()
+        if normalized in {"", "none", "keep"}:
+            return None
+        if normalized in {"float32", "fp32"}:
+            return torch.float32
+        if normalized in {"bfloat16", "bf16"}:
+            return torch.bfloat16
+        if normalized in {"float16", "fp16", "half"}:
+            return torch.float16
+        raise ValueError(f"unsupported dtype: {name}")
+
+    def _move_module(self, module, device_name: str, cpu_dtype_name: str, label: str) -> None:
+        device_name = (device_name or "").strip().lower()
+        if device_name in {"", "none", "keep"} or module is None:
+            return
+
+        dtype = self._dtype_from_name(cpu_dtype_name) if device_name == "cpu" else None
+        try:
+            if dtype is None:
+                module.to(device_name)
+            else:
+                module.to(device=device_name, dtype=dtype)
+            print(json.dumps({
+                "event": "tts_aux_module_moved",
+                "module": label,
+                "device": device_name,
+                "dtype": str(dtype) if dtype is not None else "keep",
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+        except Exception as e:
+            print(json.dumps({
+                "event": "tts_aux_module_move_failed",
+                "module": label,
+                "device": device_name,
+                "detail": str(e),
+            }), flush=True)
+            raise
+
+    def _apply_post_load_device_policy(self, wrapped_model) -> None:
+        qwen_model = getattr(wrapped_model, "model", None)
+        speech_tokenizer = getattr(qwen_model, "speech_tokenizer", None)
+        speech_tokenizer_model = getattr(speech_tokenizer, "model", None)
+        self._move_module(
+            speech_tokenizer_model,
+            self.speech_tokenizer_device,
+            self.speech_tokenizer_cpu_dtype,
+            "speech_tokenizer",
+        )
+        if speech_tokenizer is not None and self.speech_tokenizer_device not in {"", "none", "keep"}:
+            speech_tokenizer.device = torch.device(self.speech_tokenizer_device)
+
+        self._move_module(
+            getattr(qwen_model, "speaker_encoder", None),
+            self.speaker_encoder_device,
+            self.speaker_encoder_cpu_dtype,
+            "speaker_encoder",
+        )
+        cleanup_generation_memory()
+
     def _unload_model_locked(self):
         if self._model is not None:
             del self._model
             self._model = None
             self._model_id = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
+        cleanup_generation_memory()
 
     def get_model(self, model_id: str):
         if self._model is not None and self._model_id == model_id:
@@ -127,6 +250,7 @@ class QwenService:
                     attn_implementation=self.attn_impl,
                     local_files_only=self.local_files_only,
                 )
+                self._apply_post_load_device_policy(self._model)
                 self._model_id = model_id
                 model_status.update({"state": "ready", "model_id": model_id})
                 return self._model
@@ -188,8 +312,95 @@ class QwenService:
 
         return size
 
+    def _max_new_tokens_for_text(self, text: str) -> int:
+        estimated = int(len(text or "") * self.max_new_tokens_per_char) + self.max_new_tokens_buffer
+        return max(32, min(self.max_new_tokens, estimated))
+
+    def create_xvector_voice_clone_prompt(self, req: TTSRequest, user_dir: Path):
+        """Create a lightweight voice-clone prompt once per request.
+
+        Upstream qwen-tts currently runs the speech tokenizer on the reference
+        audio even when x_vector_only_mode=True, then discards those ref codes.
+        For our clone mode we only use the speaker embedding, so skip that
+        extra encode path.
+        """
+        mode = (req.mode or "clone").strip().lower()
+        if mode != "clone":
+            return None
+        if not req.reference_audio:
+            raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
+
+        size = self._resolve_model_size(mode, req.model_size or "quality")
+        if size not in MODEL_IDS[mode]:
+            size = "quality"
+        model = self.get_model(MODEL_IDS[mode][size])
+        ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
+
+        with self.generation_lock:
+            try:
+                import librosa
+
+                normalized = model._normalize_audio_inputs([str(ref_path)])
+                wav, sr = normalized[0]
+                wav_resample = wav
+                target_sr = model.model.speaker_encoder_sample_rate
+                if sr != target_sr:
+                    wav_resample = librosa.resample(
+                        y=wav_resample.astype(np.float32),
+                        orig_sr=int(sr),
+                        target_sr=int(target_sr),
+                    )
+                from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+
+                speaker_encoder = model.model.speaker_encoder
+                if speaker_encoder is None:
+                    raise RuntimeError("loaded model has no speaker_encoder")
+                try:
+                    spk_param = next(speaker_encoder.parameters())
+                    spk_device = spk_param.device
+                    spk_dtype = spk_param.dtype
+                except StopIteration:
+                    spk_device = torch.device("cpu")
+                    spk_dtype = torch.float32
+
+                mels = mel_spectrogram(
+                    torch.from_numpy(wav_resample.astype(np.float32)).unsqueeze(0),
+                    n_fft=1024,
+                    num_mels=128,
+                    sampling_rate=24000,
+                    hop_size=256,
+                    win_size=1024,
+                    fmin=0,
+                    fmax=12000,
+                ).transpose(1, 2)
+                with torch.inference_mode():
+                    spk_emb = speaker_encoder(mels.to(spk_device).to(spk_dtype))[0].detach().cpu()
+                cleanup_generation_memory()
+                return {
+                    "ref_code": [None],
+                    "ref_spk_embedding": [spk_emb],
+                    "x_vector_only_mode": [True],
+                    "icl_mode": [False],
+                }
+            except Exception as e:
+                cleanup_generation_memory()
+                raise HTTPException(status_code=500, detail=f"failed to create voice clone prompt: {e}")
+
+    def prepare_request_extra_kwargs(self, req: TTSRequest, user_dir: Path) -> dict:
+        prompt = self.create_xvector_voice_clone_prompt(req, user_dir)
+        return {"voice_clone_prompt": prompt} if prompt is not None else {}
+
     def synthesize(self, req: TTSRequest, user_dir: Path, extra_kwargs: Optional[dict] = None):
-        extra_kwargs = extra_kwargs or {}
+        extra_kwargs = extra_kwargs.copy() if extra_kwargs else {}
+        extra_kwargs.setdefault("max_new_tokens", self._max_new_tokens_for_text(req.text))
+        extra_kwargs.setdefault("non_streaming_mode", self.non_streaming_mode)
+        print(json.dumps({
+            "event": "tts_generate_start",
+            "chars": len(req.text or ""),
+            "max_new_tokens": extra_kwargs.get("max_new_tokens"),
+            "non_streaming_mode": extra_kwargs.get("non_streaming_mode"),
+            "cuda": cuda_memory_snapshot(),
+        }), flush=True)
         mode = (req.mode or "clone").strip().lower()
         if mode not in MODEL_IDS:
             raise HTTPException(status_code=400, detail="mode must be clone or design")
@@ -206,23 +417,25 @@ class QwenService:
                 raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
             model = self.get_model(model_id)
             ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
-            wavs, sr = model.generate_voice_clone(
-                text=req.text,
-                language=req.language or "Auto",
-                ref_audio=str(ref_path),
-                x_vector_only_mode=True,
-                **extra_kwargs,
-            )
+            with self.generation_lock:
+                wavs, sr = model.generate_voice_clone(
+                    text=req.text,
+                    language=req.language or "Auto",
+                    ref_audio=str(ref_path),
+                    x_vector_only_mode=True,
+                    **extra_kwargs,
+                )
         else:
             if not req.voice_description:
                 raise HTTPException(status_code=400, detail="voice_description required for design mode")
             model = self.get_model(model_id)
-            wavs, sr = model.generate_voice_design(
-                text=req.text,
-                language=req.language or "Auto",
-                instruct=req.voice_description,
-                **extra_kwargs,
-            )
+            with self.generation_lock:
+                wavs, sr = model.generate_voice_design(
+                    text=req.text,
+                    language=req.language or "Auto",
+                    instruct=req.voice_description,
+                    **extra_kwargs,
+                )
 
         return wavs[0], sr, model_id, size
 
@@ -231,10 +444,108 @@ app = FastAPI(title="qwen3-tts-api", version="0.5.0")
 svc = QwenService()
 start_time = time.time()
 
+
+def cuda_memory_snapshot():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "free_mb": int(free_bytes / (1024 * 1024)),
+            "total_mb": int(total_bytes / (1024 * 1024)),
+            "allocated_mb": int(torch.cuda.memory_allocated() / (1024 * 1024)),
+            "reserved_mb": int(torch.cuda.memory_reserved() / (1024 * 1024)),
+            "max_allocated_mb": int(torch.cuda.max_memory_allocated() / (1024 * 1024)),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cleanup_generation_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Text normalization + chunking
 # ---------------------------------------------------------------------------
-MAX_CHUNK_CHARS = int(os.getenv("QWEN_MAX_CHUNK_CHARS", "800"))
+MAX_CHUNK_CHARS = int(os.getenv("QWEN_MAX_CHUNK_CHARS", "160"))
+STREAM_PREBUFFER_CHUNKS = max(1, int(os.getenv("QWEN_STREAM_PREBUFFER_CHUNKS", "1")))
+TRIM_CHUNK_SILENCE = os.getenv("QWEN_TRIM_CHUNK_SILENCE", "1").lower() not in {"0", "false", "no"}
+TRIM_SILENCE_THRESHOLD = float(os.getenv("QWEN_TRIM_SILENCE_THRESHOLD", "0.004"))
+TRIM_SILENCE_RELATIVE_THRESHOLD = float(os.getenv("QWEN_TRIM_SILENCE_RELATIVE_THRESHOLD", "0.02"))
+TRIM_SILENCE_KEEP_MS = int(os.getenv("QWEN_TRIM_SILENCE_KEEP_MS", "60"))
+CHUNK_FADE_MS = int(os.getenv("QWEN_CHUNK_FADE_MS", "8"))
+STREAM_WAV_CHANNELS = 1
+STREAM_WAV_BITS_PER_SAMPLE = 16
+
+
+def wav_stream_header(sample_rate: int) -> bytes:
+    """Return a WAV header suitable for HTTP chunked streaming.
+
+    The final data length is unknown, so sizes are set to 0xffffffff. Most
+    browsers/players accept this for live-ish WAV streams.
+    """
+    byte_rate = sample_rate * STREAM_WAV_CHANNELS * STREAM_WAV_BITS_PER_SAMPLE // 8
+    block_align = STREAM_WAV_CHANNELS * STREAM_WAV_BITS_PER_SAMPLE // 8
+    return (
+        b"RIFF" + (0xFFFFFFFF).to_bytes(4, "little") + b"WAVE"
+        + b"fmt " + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + STREAM_WAV_CHANNELS.to_bytes(2, "little")
+        + int(sample_rate).to_bytes(4, "little")
+        + int(byte_rate).to_bytes(4, "little")
+        + int(block_align).to_bytes(2, "little")
+        + STREAM_WAV_BITS_PER_SAMPLE.to_bytes(2, "little")
+        + b"data" + (0xFFFFFFFF).to_bytes(4, "little")
+    )
+
+
+def audio_to_float_mono(wav) -> np.ndarray:
+    data = np.asarray(wav, dtype=np.float32)
+    if data.ndim > 1:
+        data = data.reshape(-1)
+    return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def postprocess_chunk_audio(wav, sample_rate: int) -> np.ndarray:
+    data = audio_to_float_mono(wav)
+    if not TRIM_CHUNK_SILENCE or data.size == 0:
+        return data
+
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak <= 0.0:
+        return data
+
+    threshold = max(TRIM_SILENCE_THRESHOLD, peak * TRIM_SILENCE_RELATIVE_THRESHOLD)
+    voiced = np.flatnonzero(np.abs(data) > threshold)
+    if voiced.size == 0:
+        return data
+
+    keep = int(sample_rate * TRIM_SILENCE_KEEP_MS / 1000)
+    start = max(0, int(voiced[0]) - keep)
+    end = min(data.size, int(voiced[-1]) + keep)
+    trimmed = data[start:end].copy()
+
+    fade = min(int(sample_rate * CHUNK_FADE_MS / 1000), trimmed.size // 2)
+    if fade > 1:
+        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        trimmed[:fade] *= ramp
+        trimmed[-fade:] *= ramp[::-1]
+
+    return trimmed
+
+
+def float_wav_to_pcm16_bytes(wav) -> bytes:
+    data = audio_to_float_mono(wav)
+    data = np.clip(data, -1.0, 1.0)
+    return (data * 32767.0).astype("<i2", copy=False).tobytes()
 
 
 def normalize_text(text: str) -> str:
@@ -491,6 +802,7 @@ def status():
         "model_state": model_status["state"],
         "model_id": model_status["model_id"],
         "uptime_s": int(time.time() - start_time),
+        "cuda": cuda_memory_snapshot(),
     }
 
 
@@ -512,6 +824,20 @@ def info():
         "sizes": ["fast", "quality", "auto"],
         "current_model": svc._model_id,
         "supported_languages": SUPPORTED_LANGUAGES,
+        "generation": {
+            "max_chunk_chars": MAX_CHUNK_CHARS,
+            "stream_prebuffer_chunks": STREAM_PREBUFFER_CHUNKS,
+            "trim_chunk_silence": TRIM_CHUNK_SILENCE,
+            "trim_silence_keep_ms": TRIM_SILENCE_KEEP_MS,
+            "chunk_fade_ms": CHUNK_FADE_MS,
+            "max_new_tokens_hard_cap": svc.max_new_tokens,
+            "max_new_tokens_per_char": svc.max_new_tokens_per_char,
+            "max_new_tokens_buffer": svc.max_new_tokens_buffer,
+            "non_streaming_mode": svc.non_streaming_mode,
+            "speech_tokenizer_device": svc.speech_tokenizer_device,
+            "speaker_encoder_device": svc.speaker_encoder_device,
+            "qwen_memory_patch": QWEN_MEMORY_PATCH_ENABLED,
+        },
     }
 
 
@@ -650,6 +976,135 @@ def delete_voice_preset(name: str, user: str = Query(default="default")):
     return {"ok": True, "deleted": preset_name}
 
 
+@app.post("/api/tts/audio-stream")
+def tts_audio_stream(req: TTSRequest):
+    """Stream audio bytes as they are generated chunk-by-chunk.
+
+    This is real HTTP audio streaming at the API layer: each text chunk is
+    synthesized, immediately converted to PCM16, yielded, then released. It
+    avoids holding the full utterance in RAM/VRAM like /api/tts and the SSE
+    endpoint do. The qwen-tts 0.1.1 library itself does not expose token-level
+    audio frames, so chunk boundaries are currently the streaming granularity.
+    """
+    req = apply_voice_preset(req)
+    user_dir = user_audio_dir(req.user or "default")
+    audio_format = req.audio_format.lower().strip()
+    if audio_format != "wav":
+        raise HTTPException(status_code=400, detail="audio_format must be wav for audio-stream endpoint")
+
+    chunks = chunk_text(req.text)
+    n_chunks = len(chunks)
+    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
+
+    def build_stream_payload(i: int, chunk: str, sr_final: Optional[int]):
+        t_chunk = time.time()
+        chunk_req = req.model_copy(update={"text": chunk})
+        wav, sr, used_model_id, used_size = svc.synthesize(
+            chunk_req,
+            user_dir,
+            extra_kwargs={**base_extra_kwargs, "non_streaming_mode": False},
+        )
+
+        raw_samples = int(np.asarray(wav).size)
+        wav = postprocess_chunk_audio(wav, int(sr))
+        trimmed_samples = int(wav.size)
+        audio_ms = int((trimmed_samples / max(int(sr), 1)) * 1000)
+        pcm = float_wav_to_pcm16_bytes(wav)
+        del wav
+        cleanup_generation_memory()
+
+        if sr_final is None:
+            sr_final = int(sr)
+            payload = wav_stream_header(sr_final) + pcm
+        elif int(sr) != sr_final:
+            raise RuntimeError(f"sample rate changed during stream: {sr_final} -> {sr}")
+        else:
+            payload = pcm
+
+        print(json.dumps({
+            "event": "tts_audio_stream_chunk",
+            "chunk": i + 1,
+            "of": n_chunks,
+            "chars": len(chunk),
+            "bytes": len(payload),
+            "audio_ms": audio_ms,
+            "raw_samples": raw_samples,
+            "trimmed_samples": trimmed_samples,
+            "rtf": round((time.time() - t_chunk) / max(audio_ms / 1000, 0.001), 2),
+            "t_chunk_ms": int((time.time() - t_chunk) * 1000),
+            "cuda": cuda_memory_snapshot(),
+        }), flush=True)
+        return payload, sr_final, used_model_id, used_size
+
+    # Generate one or more chunks before sending HTTP headers. If this fails,
+    # the client gets a proper JSON 500 instead of an apparently successful
+    # stream with zero bytes. Setting QWEN_STREAM_PREBUFFER_CHUNKS > 1 trades
+    # first-audio latency for fewer playback underruns/gaps on slow hardware.
+    prebuffer_count = min(STREAM_PREBUFFER_CHUNKS, n_chunks)
+    prebuffered_payloads: list[bytes] = []
+    sr_final: Optional[int] = None
+    used_model_id = ""
+    used_size = ""
+    try:
+        for i, chunk in enumerate(chunks[:prebuffer_count]):
+            payload, sr_final, used_model_id, used_size = build_stream_payload(i, chunk, sr_final)
+            prebuffered_payloads.append(payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        cleanup_generation_memory()
+        print(json.dumps({
+            "event": "tts_audio_stream_first_chunk_error",
+            "detail": str(e),
+            "chunks": n_chunks,
+            "prebuffer_chunks": prebuffer_count,
+            "cuda": cuda_memory_snapshot(),
+        }), flush=True)
+        raise HTTPException(status_code=500, detail=f"tts audio stream failed before first bytes: {e}")
+
+    def audio_iter():
+        nonlocal sr_final, used_model_id, used_size
+        t0 = time.time()
+        try:
+            for payload in prebuffered_payloads:
+                yield payload
+            for i, chunk in enumerate(chunks[prebuffer_count:], start=prebuffer_count):
+                payload, sr_final, used_model_id, used_size = build_stream_payload(i, chunk, sr_final)
+                yield payload
+                del payload
+
+            print(json.dumps({
+                "event": "tts_audio_stream_done",
+                "mode": req.mode,
+                "model_size": used_size,
+                "chars": len(req.text or ""),
+                "chunks": n_chunks,
+                "prebuffer_chunks": prebuffer_count,
+                "model_id": used_model_id,
+                "t_total_ms": int((time.time() - t0) * 1000),
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+        except Exception as e:
+            cleanup_generation_memory()
+            print(json.dumps({
+                "event": "tts_audio_stream_error",
+                "detail": str(e),
+                "chunks": n_chunks,
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+            raise
+
+    return StreamingResponse(
+        audio_iter(),
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Content-Disposition": 'inline; filename="tts-stream.wav"',
+        },
+    )
+
+
 @app.post("/api/tts/stream")
 def tts_stream(req: TTSRequest):
     req = apply_voice_preset(req)
@@ -660,6 +1115,7 @@ def tts_stream(req: TTSRequest):
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
+    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
 
     q: queue.Queue = queue.Queue()
 
@@ -670,7 +1126,7 @@ def tts_stream(req: TTSRequest):
             total_tokens = 0
 
             for chunk_idx, chunk in enumerate(chunks):
-                chunk_estimated = max(1, int((len(chunk) / 5) * 2.5 * 12))
+                chunk_estimated = max(1, svc._max_new_tokens_for_text(chunk))
                 chunk_token_count = [0]
 
                 q.put(("chunk_start", {
@@ -700,10 +1156,14 @@ def tts_stream(req: TTSRequest):
                     chunk_req,
                     user_dir,
                     extra_kwargs={
+                        **base_extra_kwargs,
                         "logits_processor": LogitsProcessorList([ProgressProcessor()]),
                     },
                 )
+                wav = postprocess_chunk_audio(wav, int(sr))
                 wav_arrays.append(np.asarray(wav, dtype=np.float32))
+                del wav
+                cleanup_generation_memory()
                 sr_final = sr
                 total_tokens += chunk_token_count[0]
 
@@ -755,6 +1215,7 @@ def tts(req: TTSRequest):
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
+    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
 
     t1 = time.time()
     wav_arrays: list[np.ndarray] = []
@@ -764,8 +1225,11 @@ def tts(req: TTSRequest):
 
     for i, chunk in enumerate(chunks):
         chunk_req = req.model_copy(update={"text": chunk})
-        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req, user_dir)
+        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req, user_dir, extra_kwargs=base_extra_kwargs)
+        wav = postprocess_chunk_audio(wav, int(sr))
         wav_arrays.append(np.asarray(wav, dtype=np.float32))
+        del wav
+        cleanup_generation_memory()
         sr_final = sr
         if n_chunks > 1:
             print(json.dumps({"event": "tts_chunk", "chunk": i + 1, "of": n_chunks, "chars": len(chunk)}))

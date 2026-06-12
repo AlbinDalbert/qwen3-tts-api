@@ -26,4 +26,4 @@ jobs:
           context: .
           push: true
           platforms: linux/arm64
-          tags: ghcr.io/sententia-bot/qwen3-tts-api:latest
+          tags: ghcr.io/albindalbert/qwen3-tts-api:latest
