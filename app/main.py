@@ -46,8 +46,32 @@ MODEL_IDS = {
         "quality": os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
     },
 }
-model_status = {"state": "idle", "model_id": None}  # idle | loading | ready
+model_status = {"state": "idle", "model_id": None, "device": None}  # idle | loading | ready
 QWEN_MEMORY_PATCH_ENABLED = False
+
+
+def is_cuda_out_of_memory(exc: BaseException) -> bool:
+    """Recognize CUDA allocation failures, including wrapped PyTorch errors."""
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    markers = (
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "cuda_error_out_of_memory",
+        "cublas_status_alloc_failed",
+    )
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, torch.cuda.OutOfMemoryError):
+            return True
+        if any(marker in str(current).lower() for marker in markers):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def gpu_busy_error() -> HTTPException:
+    return HTTPException(status_code=503, detail="GPU busy", headers={"Retry-After": "5"})
 
 
 def patch_qwen_tts_memory() -> None:
@@ -111,6 +135,7 @@ class TTSRequest(BaseModel):
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
     user: Optional[str] = Field(default="default", description="User namespace for reference audio")
+    cpu_mode: bool = Field(default=False, description="Run this request on CPU; no automatic fallback")
 
 
 class SaveDesignRequest(BaseModel):
@@ -134,6 +159,8 @@ class QwenService:
         self.device = os.getenv("QWEN_DEVICE", "cuda:0")
         self.dtype = os.getenv("QWEN_DTYPE", "bfloat16")
         self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "flash_attention_2")
+        self.cpu_dtype = os.getenv("QWEN_CPU_DTYPE", "float32")
+        self.cpu_attn_impl = os.getenv("QWEN_CPU_ATTN_IMPL", "sdpa")
         # Force local-only model resolution by default so runtime never depends on
         # live Hugging Face API checks (works with pre-populated HF cache).
         self.local_files_only = os.getenv("QWEN_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
@@ -157,9 +184,14 @@ class QwenService:
         self.generation_lock = threading.Lock()
         self._model = None
         self._model_id: Optional[str] = None
+        self._model_device: Optional[str] = None
 
-    def _torch_dtype(self):
-        return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
+    def _torch_dtype(self, device: str):
+        dtype_name = self.cpu_dtype if device == "cpu" else self.dtype
+        dtype = self._dtype_from_name(dtype_name)
+        if dtype is None:
+            raise ValueError(f"QWEN_{'CPU_' if device == 'cpu' else ''}DTYPE must specify a dtype")
+        return dtype
 
     def _dtype_from_name(self, name: str):
         normalized = (name or "").strip().lower()
@@ -200,22 +232,26 @@ class QwenService:
             }), flush=True)
             raise
 
-    def _apply_post_load_device_policy(self, wrapped_model) -> None:
+    def _apply_post_load_device_policy(self, wrapped_model, model_device: str) -> None:
         qwen_model = getattr(wrapped_model, "model", None)
         speech_tokenizer = getattr(qwen_model, "speech_tokenizer", None)
         speech_tokenizer_model = getattr(speech_tokenizer, "model", None)
+        # cpu_mode applies to the complete pipeline. It must never move an
+        # auxiliary module back to CUDA through the normal GPU profile.
+        speech_tokenizer_device = "cpu" if model_device == "cpu" else self.speech_tokenizer_device
+        speaker_encoder_device = "cpu" if model_device == "cpu" else self.speaker_encoder_device
         self._move_module(
             speech_tokenizer_model,
-            self.speech_tokenizer_device,
+            speech_tokenizer_device,
             self.speech_tokenizer_cpu_dtype,
             "speech_tokenizer",
         )
-        if speech_tokenizer is not None and self.speech_tokenizer_device not in {"", "none", "keep"}:
-            speech_tokenizer.device = torch.device(self.speech_tokenizer_device)
+        if speech_tokenizer is not None and speech_tokenizer_device not in {"", "none", "keep"}:
+            speech_tokenizer.device = torch.device(speech_tokenizer_device)
 
         self._move_module(
             getattr(qwen_model, "speaker_encoder", None),
-            self.speaker_encoder_device,
+            speaker_encoder_device,
             self.speaker_encoder_cpu_dtype,
             "speaker_encoder",
         )
@@ -225,11 +261,13 @@ class QwenService:
         if self._model is not None:
             del self._model
             self._model = None
-            self._model_id = None
+        self._model_id = None
+        self._model_device = None
         cleanup_generation_memory()
 
-    def get_model(self, model_id: str):
-        if self._model is not None and self._model_id == model_id:
+    def get_model(self, model_id: str, cpu_mode: bool = False):
+        model_device = "cpu" if cpu_mode else self.device.strip().lower()
+        if self._model is not None and self._model_id == model_id and self._model_device == model_device:
             return self._model
 
         if not self.load_lock.acquire(blocking=False):
@@ -237,25 +275,42 @@ class QwenService:
 
         try:
             with self.lock:
-                if self._model is not None and self._model_id == model_id:
+                if self._model is not None and self._model_id == model_id and self._model_device == model_device:
                     return self._model
 
-                model_status.update({"state": "loading", "model_id": model_id})
+                model_status.update({"state": "loading", "model_id": model_id, "device": model_device})
                 self._unload_model_locked()
 
-                self._model = Qwen3TTSModel.from_pretrained(
-                    model_id,
-                    device_map=self.device,
-                    dtype=self._torch_dtype(),
-                    attn_implementation=self.attn_impl,
-                    local_files_only=self.local_files_only,
-                )
-                self._apply_post_load_device_policy(self._model)
+                try:
+                    self._model = Qwen3TTSModel.from_pretrained(
+                        model_id,
+                        device_map=model_device,
+                        dtype=self._torch_dtype(model_device),
+                        attn_implementation=self.cpu_attn_impl if model_device == "cpu" else self.attn_impl,
+                        local_files_only=self.local_files_only,
+                    )
+                    self._apply_post_load_device_policy(self._model, model_device)
+                except Exception as e:
+                    # A failed load can leave a partially constructed model and
+                    # CUDA cache allocations behind. Release both before replying.
+                    self._unload_model_locked()
+                    if model_device.startswith("cuda") and is_cuda_out_of_memory(e):
+                        print(json.dumps({
+                            "event": "tts_model_load_gpu_busy",
+                            "model_id": model_id,
+                            "device": model_device,
+                            "detail": str(e),
+                            "cuda": cuda_memory_snapshot(),
+                        }), flush=True)
+                        raise gpu_busy_error() from None
+                    raise
+
                 self._model_id = model_id
-                model_status.update({"state": "ready", "model_id": model_id})
+                self._model_device = model_device
+                model_status.update({"state": "ready", "model_id": model_id, "device": model_device})
                 return self._model
         except Exception:
-            model_status.update({"state": "idle", "model_id": None})
+            model_status.update({"state": "idle", "model_id": None, "device": None})
             raise
         finally:
             self.load_lock.release()
@@ -272,7 +327,7 @@ class QwenService:
                 unloaded_model_id = self._model_id
                 had_model = self._model is not None
                 self._unload_model_locked()
-                model_status.update({"state": "idle", "model_id": None})
+                model_status.update({"state": "idle", "model_id": None, "device": None})
 
         if had_model:
             print(json.dumps({
@@ -292,7 +347,7 @@ class QwenService:
             raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
         return candidate
 
-    def _resolve_model_size(self, mode: str, requested_size: str) -> str:
+    def _resolve_model_size(self, mode: str, requested_size: str, cpu_mode: bool = False) -> str:
         size = (requested_size or "quality").strip().lower()
         if size not in {"fast", "quality", "auto"}:
             size = "quality"
@@ -302,14 +357,16 @@ class QwenService:
             free_vram_bytes = 0
             total_vram_bytes = 0
 
-            if torch.cuda.is_available():
+            if not cpu_mode and torch.cuda.is_available():
                 try:
                     free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info()
                 except Exception:
                     free_vram_bytes = 0
                     total_vram_bytes = 0
 
-            selected_size = "quality" if free_vram_bytes >= threshold_bytes else "fast"
+            # CUDA availability is irrelevant to a CPU-only request. Prefer
+            # the smaller model there (design is normalized to quality below).
+            selected_size = "fast" if cpu_mode else ("quality" if free_vram_bytes >= threshold_bytes else "fast")
             print(
                 json.dumps(
                     {
@@ -335,6 +392,11 @@ class QwenService:
         estimated = int(len(text or "") * self.max_new_tokens_per_char) + self.max_new_tokens_buffer
         return max(32, min(self.max_new_tokens, estimated))
 
+    def _raise_gpu_busy_if_oom(self, exc: BaseException) -> None:
+        if (self._model_device or "").startswith("cuda") and is_cuda_out_of_memory(exc):
+            cleanup_generation_memory()
+            raise gpu_busy_error() from None
+
     def create_xvector_voice_clone_prompt(self, req: TTSRequest, user_dir: Path):
         """Create a lightweight voice-clone prompt once per request.
 
@@ -349,10 +411,10 @@ class QwenService:
         if not req.reference_audio:
             raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
 
-        size = self._resolve_model_size(mode, req.model_size or "quality")
+        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
         if size not in MODEL_IDS[mode]:
             size = "quality"
-        model = self.get_model(MODEL_IDS[mode][size])
+        model = self.get_model(MODEL_IDS[mode][size], req.cpu_mode)
         ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
 
         with self.generation_lock:
@@ -403,11 +465,25 @@ class QwenService:
                 }
             except Exception as e:
                 cleanup_generation_memory()
+                self._raise_gpu_busy_if_oom(e)
                 raise HTTPException(status_code=500, detail=f"failed to create voice clone prompt: {e}")
 
     def prepare_request_extra_kwargs(self, req: TTSRequest, user_dir: Path) -> dict:
-        prompt = self.create_xvector_voice_clone_prompt(req, user_dir)
-        return {"voice_clone_prompt": prompt} if prompt is not None else {}
+        """Validate and load before an endpoint commits streaming headers."""
+        mode = (req.mode or "clone").strip().lower()
+        if mode == "clone":
+            prompt = self.create_xvector_voice_clone_prompt(req, user_dir)
+            return {"voice_clone_prompt": prompt}
+        if mode != "design":
+            raise HTTPException(status_code=400, detail="mode must be clone or design")
+        if not req.voice_description:
+            raise HTTPException(status_code=400, detail="voice_description required for design mode")
+
+        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
+        if size not in MODEL_IDS[mode]:
+            size = "quality"
+        self.get_model(MODEL_IDS[mode][size], req.cpu_mode)
+        return {}
 
     def synthesize(self, req: TTSRequest, user_dir: Path, extra_kwargs: Optional[dict] = None):
         extra_kwargs = extra_kwargs.copy() if extra_kwargs else {}
@@ -424,7 +500,7 @@ class QwenService:
         if mode not in MODEL_IDS:
             raise HTTPException(status_code=400, detail="mode must be clone or design")
 
-        size = self._resolve_model_size(mode, req.model_size or "quality")
+        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
 
         if size not in MODEL_IDS[mode]:
             size = "quality"
@@ -434,32 +510,40 @@ class QwenService:
         if mode == "clone":
             if not req.reference_audio:
                 raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
-            model = self.get_model(model_id)
+            model = self.get_model(model_id, req.cpu_mode)
             ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
-            with self.generation_lock:
-                wavs, sr = model.generate_voice_clone(
-                    text=req.text,
-                    language=req.language or "Auto",
-                    ref_audio=str(ref_path),
-                    x_vector_only_mode=True,
-                    **extra_kwargs,
-                )
+            try:
+                with self.generation_lock:
+                    wavs, sr = model.generate_voice_clone(
+                        text=req.text,
+                        language=req.language or "Auto",
+                        ref_audio=str(ref_path),
+                        x_vector_only_mode=True,
+                        **extra_kwargs,
+                    )
+            except Exception as e:
+                self._raise_gpu_busy_if_oom(e)
+                raise
         else:
             if not req.voice_description:
                 raise HTTPException(status_code=400, detail="voice_description required for design mode")
-            model = self.get_model(model_id)
-            with self.generation_lock:
-                wavs, sr = model.generate_voice_design(
-                    text=req.text,
-                    language=req.language or "Auto",
-                    instruct=req.voice_description,
-                    **extra_kwargs,
-                )
+            model = self.get_model(model_id, req.cpu_mode)
+            try:
+                with self.generation_lock:
+                    wavs, sr = model.generate_voice_design(
+                        text=req.text,
+                        language=req.language or "Auto",
+                        instruct=req.voice_description,
+                        **extra_kwargs,
+                    )
+            except Exception as e:
+                self._raise_gpu_busy_if_oom(e)
+                raise
 
         return wavs[0], sr, model_id, size
 
 
-app = FastAPI(title="qwen3-tts-api", version="0.5.0")
+app = FastAPI(title="qwen3-tts-api", version="0.6.0")
 svc = QwenService()
 start_time = time.time()
 
@@ -820,6 +904,7 @@ def status():
     return {
         "model_state": model_status["state"],
         "model_id": model_status["model_id"],
+        "device": model_status["device"],
         "uptime_s": int(time.time() - start_time),
         "cuda": cuda_memory_snapshot(),
     }
@@ -828,7 +913,7 @@ def status():
 @app.get("/readyz")
 def readyz():
     if model_status["state"] == "ready":
-        return {"ready": True, "model_id": model_status["model_id"]}
+        return {"ready": True, "model_id": model_status["model_id"], "device": model_status["device"]}
     return JSONResponse(
         status_code=503,
         content={"ready": False, "reason": model_status["state"]},
@@ -842,6 +927,7 @@ def info():
         "modes": ["clone", "design"],
         "sizes": ["fast", "quality", "auto"],
         "current_model": svc._model_id,
+        "current_device": svc._model_device,
         "supported_languages": SUPPORTED_LANGUAGES,
         "generation": {
             "max_chunk_chars": MAX_CHUNK_CHARS,
@@ -853,6 +939,10 @@ def info():
             "max_new_tokens_per_char": svc.max_new_tokens_per_char,
             "max_new_tokens_buffer": svc.max_new_tokens_buffer,
             "non_streaming_mode": svc.non_streaming_mode,
+            "default_device": svc.device,
+            "cpu_mode_supported": True,
+            "cpu_dtype": svc.cpu_dtype,
+            "cpu_attn_impl": svc.cpu_attn_impl,
             "speech_tokenizer_device": svc.speech_tokenizer_device,
             "speaker_encoder_device": svc.speaker_encoder_device,
             "qwen_memory_patch": QWEN_MEMORY_PATCH_ENABLED,
@@ -864,7 +954,7 @@ def info():
 def reset(req: Optional[ResetRequest] = None):
     svc.hard_reset()
 
-    response = {"ok": True, "state": "idle", "model_id": None}
+    response = {"ok": True, "state": "idle", "model_id": None, "device": None}
     if req and req.restart:
         exit_code = int(os.getenv("QWEN_RESET_EXIT_CODE", "1"))
 
@@ -1216,7 +1306,11 @@ def tts_stream(req: TTSRequest):
                 "tokens_generated": total_tokens,
             }))
         except Exception as e:
-            q.put(("error", {"detail": str(e)}))
+            detail = e.detail if isinstance(e, HTTPException) else str(e)
+            payload = {"detail": detail}
+            if isinstance(e, HTTPException):
+                payload["status_code"] = e.status_code
+            q.put(("error", payload))
         finally:
             svc.unload_model()
 

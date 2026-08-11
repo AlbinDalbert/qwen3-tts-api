@@ -19,6 +19,7 @@ Request JSON:
   "audio_format": "wav",
   "mode": "design",
   "model_size": "quality",
+  "cpu_mode": false,
   "voice_preset": "sentia_calm",
   "voice_description": "Optional explicit design description",
   "reference_audio": "myvoice.wav"
@@ -53,6 +54,17 @@ Fields:
 - `reference_audio` (required in `clone` mode)
 - `voice_description` (required in `design` mode unless `voice_preset` is provided)
 - `voice_preset` (optional preset name from `/voice-presets`; overrides `voice_description` and forces `design` mode)
+- `cpu_mode` (default `false`; when `true`, runs the complete TTS pipeline on CPU with no GPU fallback)
+
+### Errors
+
+If CUDA runs out of VRAM while loading or running a requested model, the API returns HTTP `503` with a retry hint (or an equivalent error event if streaming headers were already sent):
+
+```json
+{"detail":"GPU busy"}
+```
+
+CPU mode is explicit only: the API never falls back from GPU to CPU automatically.
 
 ### `GET /healthz`
 Process health.
@@ -146,6 +158,8 @@ kubectl rollout restart deployment/qwen3-tts-api-caladan -n sietch-sentia
 - `QWEN_DEVICE`
 - `QWEN_DTYPE`
 - `QWEN_ATTN_IMPL` (default `sdpa`; use `eager` if SDPA causes trouble)
+- `QWEN_CPU_DTYPE` (default `float32`; used when request `cpu_mode=true`)
+- `QWEN_CPU_ATTN_IMPL` (default `sdpa`; used when request `cpu_mode=true`)
 - `QWEN_DEFAULT_LANGUAGE`
 - `QWEN_DEFAULT_SPEAKER`
 - `QWEN_DEFAULT_INSTRUCT`
@@ -190,7 +204,7 @@ QWEN_MAX_NEW_TOKENS_PER_CHAR=2.0
 QWEN_MAX_NEW_TOKENS_BUFFER=64
 ```
 
-`QWEN_DEVICE` controls the main Qwen generator. `QWEN_SPEECH_TOKENIZER_DEVICE` controls the codec/vocoder decoder, and `QWEN_SPEAKER_ENCODER_DEVICE` controls clone speaker embedding extraction. Use `cpu`, `cuda:0`, or `keep`.
+`QWEN_DEVICE` controls the main Qwen generator. `QWEN_SPEECH_TOKENIZER_DEVICE` controls the codec/vocoder decoder, and `QWEN_SPEAKER_ENCODER_DEVICE` controls clone speaker embedding extraction. Use `cpu`, `cuda:0`, or `keep`. A request with `cpu_mode=true` overrides these device settings for that request and keeps the complete pipeline on CPU.
 
 ## Notes
 
