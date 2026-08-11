@@ -260,10 +260,29 @@ class QwenService:
         finally:
             self.load_lock.release()
 
+    def unload_model(self) -> None:
+        """Drop the loaded model and release its CUDA allocations.
+
+        Wait for an in-flight chunk to finish before removing the service's
+        final model reference. TTS endpoints call this once their complete
+        request (including all chunks) has finished.
+        """
+        with self.generation_lock:
+            with self.lock:
+                unloaded_model_id = self._model_id
+                had_model = self._model is not None
+                self._unload_model_locked()
+                model_status.update({"state": "idle", "model_id": None})
+
+        if had_model:
+            print(json.dumps({
+                "event": "tts_model_unloaded",
+                "model_id": unloaded_model_id,
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+
     def hard_reset(self):
-        with self.lock:
-            self._unload_model_locked()
-            model_status.update({"state": "idle", "model_id": None})
+        self.unload_model()
 
     def resolve_reference_audio(self, filename: str, user_dir: Path) -> Path:
         candidate = (user_dir / filename).resolve()
@@ -994,7 +1013,11 @@ def tts_audio_stream(req: TTSRequest):
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
-    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
+    try:
+        base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
+    except Exception:
+        svc.unload_model()
+        raise
 
     def build_stream_payload(i: int, chunk: str, sr_final: Optional[int]):
         t_chunk = time.time()
@@ -1050,6 +1073,7 @@ def tts_audio_stream(req: TTSRequest):
             payload, sr_final, used_model_id, used_size = build_stream_payload(i, chunk, sr_final)
             prebuffered_payloads.append(payload)
     except HTTPException:
+        svc.unload_model()
         raise
     except Exception as e:
         cleanup_generation_memory()
@@ -1060,6 +1084,7 @@ def tts_audio_stream(req: TTSRequest):
             "prebuffer_chunks": prebuffer_count,
             "cuda": cuda_memory_snapshot(),
         }), flush=True)
+        svc.unload_model()
         raise HTTPException(status_code=500, detail=f"tts audio stream failed before first bytes: {e}")
 
     def audio_iter():
@@ -1093,6 +1118,10 @@ def tts_audio_stream(req: TTSRequest):
                 "cuda": cuda_memory_snapshot(),
             }), flush=True)
             raise
+        finally:
+            # A StreamingResponse may end normally, fail, or be closed when the
+            # client disconnects. In every case, release the model from VRAM.
+            svc.unload_model()
 
     return StreamingResponse(
         audio_iter(),
@@ -1115,7 +1144,11 @@ def tts_stream(req: TTSRequest):
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
-    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
+    try:
+        base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
+    except Exception:
+        svc.unload_model()
+        raise
 
     q: queue.Queue = queue.Queue()
 
@@ -1184,6 +1217,8 @@ def tts_stream(req: TTSRequest):
             }))
         except Exception as e:
             q.put(("error", {"detail": str(e)}))
+        finally:
+            svc.unload_model()
 
     threading.Thread(target=run_generation, daemon=True).start()
 
@@ -1215,58 +1250,63 @@ def tts(req: TTSRequest):
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
-    base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
-
-    t1 = time.time()
-    wav_arrays: list[np.ndarray] = []
-    sr_final: int = 24000
-    used_model_id: str = ""
-    used_size: str = ""
-
-    for i, chunk in enumerate(chunks):
-        chunk_req = req.model_copy(update={"text": chunk})
-        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req, user_dir, extra_kwargs=base_extra_kwargs)
-        wav = postprocess_chunk_audio(wav, int(sr))
-        wav_arrays.append(np.asarray(wav, dtype=np.float32))
-        del wav
-        cleanup_generation_memory()
-        sr_final = sr
-        if n_chunks > 1:
-            print(json.dumps({"event": "tts_chunk", "chunk": i + 1, "of": n_chunks, "chars": len(chunk)}))
-
-    data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
-    t2 = time.time()
-
-    buf = io.BytesIO()
-    if audio_format == "wav":
-        sf.write(buf, data, sr_final, format="WAV")
-        mime = "audio/wav"
-    else:
-        sf.write(buf, data, sr_final, format="OGG", subtype="VORBIS")
-        mime = "audio/ogg"
-    t3 = time.time()
-
-    total = t3 - t0
-    t_synth = t2 - t1
-    t_encode = t3 - t2
-
     try:
-        print(
-            json.dumps(
-                {
-                    "event": "tts_timing",
-                    "mode": req.mode,
-                    "model_size": used_size,
-                    "chars": len(req.text or ""),
-                    "chunks": n_chunks,
-                    "model_id": used_model_id,
-                    "t_total_ms": int(total * 1000),
-                    "t_synth_ms": int(t_synth * 1000),
-                    "t_encode_ms": int(t_encode * 1000),
-                }
-            )
-        )
-    except Exception:
-        pass
+        base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
 
-    return Response(content=buf.getvalue(), media_type=mime)
+        t1 = time.time()
+        wav_arrays: list[np.ndarray] = []
+        sr_final: int = 24000
+        used_model_id: str = ""
+        used_size: str = ""
+
+        for i, chunk in enumerate(chunks):
+            chunk_req = req.model_copy(update={"text": chunk})
+            wav, sr, used_model_id, used_size = svc.synthesize(
+                chunk_req, user_dir, extra_kwargs=base_extra_kwargs
+            )
+            wav = postprocess_chunk_audio(wav, int(sr))
+            wav_arrays.append(np.asarray(wav, dtype=np.float32))
+            del wav
+            cleanup_generation_memory()
+            sr_final = sr
+            if n_chunks > 1:
+                print(json.dumps({"event": "tts_chunk", "chunk": i + 1, "of": n_chunks, "chars": len(chunk)}))
+
+        data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
+        t2 = time.time()
+
+        buf = io.BytesIO()
+        if audio_format == "wav":
+            sf.write(buf, data, sr_final, format="WAV")
+            mime = "audio/wav"
+        else:
+            sf.write(buf, data, sr_final, format="OGG", subtype="VORBIS")
+            mime = "audio/ogg"
+        t3 = time.time()
+
+        total = t3 - t0
+        t_synth = t2 - t1
+        t_encode = t3 - t2
+
+        try:
+            print(
+                json.dumps(
+                    {
+                        "event": "tts_timing",
+                        "mode": req.mode,
+                        "model_size": used_size,
+                        "chars": len(req.text or ""),
+                        "chunks": n_chunks,
+                        "model_id": used_model_id,
+                        "t_total_ms": int(total * 1000),
+                        "t_synth_ms": int(t_synth * 1000),
+                        "t_encode_ms": int(t_encode * 1000),
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        return Response(content=buf.getvalue(), media_type=mime)
+    finally:
+        svc.unload_model()

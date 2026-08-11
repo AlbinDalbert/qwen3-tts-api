@@ -194,6 +194,7 @@ QWEN_MAX_NEW_TOKENS_BUFFER=64
 
 ## Notes
 
+- TTS models are loaded on demand and explicitly unloaded after every completed TTS request, including streamed requests and failed generations. This releases their CUDA allocations; the next request incurs model load time.
 - `POST /reference-audio/upload` requires `python-multipart`.
 - If FlashAttention2 fails, set `QWEN_ATTN_IMPL=eager`.
 
